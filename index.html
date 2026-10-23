@@ -131,6 +131,9 @@ tbody tr:hover td{background:var(--plank2)}
 tbody tr:last-child td{border-bottom:0}
 td.pos{color:var(--amber);font-weight:600}
 td.neg{color:var(--brick)}
+tr.main-rung td{background:rgba(240,166,48,.07)}
+table.grid-tbl th,table.grid-tbl td{padding:8px 5px;font-size:13px;white-space:nowrap}
+table.grid-tbl .badge{display:block;width:max-content;margin-top:2px}
 td.muted,span.muted{color:var(--faint)}
 tr.click{cursor:pointer}
 
@@ -252,7 +255,7 @@ input[type=range]{accent-color:var(--amber)}
    NBA player props: trends, matchup context, multi book price shopping,
    consensus fair pricing and closing line value. The NBA sibling of Chains.
    ===================================================================== */
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const APP_NAME = 'Hoops';
 
 /* ---------- Model constants (fitted offline on 2022-23 to 2025-26 box scores) ----------
@@ -430,6 +433,85 @@ function muFromQuote(mk, L, qNoVig) {
   for (let i = 0; i < 60; i++) { const mid = (lo + hi) / 2; if (rawSides(mid, mk, L).q < qNoVig) lo = mid; else hi = mid; }
   return (lo + hi) / 2;
 }
+/* ---------- Probability grid: one fitted distribution per prop, priced at every rung ----------
+   Idea from martineastwood/penaltyblog (MIT licensed): fit a distribution to the market, then read every
+   line off it. No code was copied. Counts (REB, AST, 3PM) use Poisson or negative binomial; points and PRA
+   use normal or log-normal. The mean is solved so P(over main line) equals the no vig over chance. */
+const GRID_COUNT = { rebounds: 1, assists: 1, threes: 1 };
+const GRID_K = 10; // pseudo games of the per-stat default blended into the player's own spread
+const poisPmf = (k, mu) => mu <= 0 ? (k === 0 ? 1 : 0) : Math.exp(k * Math.log(mu) - mu - LG(k + 1));
+function gridShape(mk, games, refLine) {
+  const m = MARKETS[mk], xs = (games || []).slice(-20).map(r => r[m.col]).filter(fin), n = xs.length;
+  const mean = n ? xs.reduce((a, b) => a + b, 0) / n : 0;
+  const v = n > 1 ? xs.reduce((a, b) => a + (b - mean) * (b - mean), 0) / (n - 1) : 0;
+  const w = n >= 5 ? n / (n + GRID_K) : 0, src = w ? `last ${n} games` : 'stat default';
+  if (GRID_COUNT[mk]) {
+    if (n >= 8 && mean > 0 && v <= mean * 1.1) return { fam: 'poisson', n, src };
+    const aDef = 1 / m.r, aOwn = mean > 0 ? Math.max(0, (v - mean) / (mean * mean)) : aDef;
+    return { fam: 'nb', r: 1 / Math.max(1e-3, w * aOwn + (1 - w) * aDef), n, src };
+  }
+  const ref = mean > 0 ? mean : (refLine || 10), cv2Def = 1 / Math.max(1, ref) + 1 / m.r;
+  const cv = Math.sqrt(w * (mean > 0 ? v / (mean * mean) : cv2Def) + (1 - w) * cv2Def);
+  let skew = 0;
+  if (n >= 8 && v > 0) skew = (xs.reduce((a, b) => a + Math.pow(b - mean, 3), 0) / n) / Math.pow(v * (n - 1) / n, 1.5);
+  return { fam: skew > 0.5 || cv > 0.5 ? 'lognormal' : 'normal', cv, n, src };
+}
+/* P(X <= k) for whole k. Continuous families get a half unit continuity correction. */
+function gridCdf(sh, mu) {
+  if (sh.fam === 'normal') return k => k < 0 ? 0 : Phi((k + 0.5 - mu) / (sh.cv * mu));
+  if (sh.fam === 'lognormal') { const s2 = Math.log(1 + sh.cv * sh.cv), s = Math.sqrt(s2), m0 = Math.log(mu) - s2 / 2; return k => k < 0 ? 0 : Phi((Math.log(k + 0.5) - m0) / s); }
+  const pm = sh.fam === 'poisson' ? k => poisPmf(k, mu) : k => nbPmf(k, mu, sh.r), cum = [];
+  return k => { if (k < 0) return 0; while (cum.length <= k) cum.push((cum.length ? cum[cum.length - 1] : 0) + pm(cum.length)); return Math.min(1, cum[k]); };
+}
+function gridSides(sh, mu, L) {
+  const cdf = gridCdf(sh, mu), over = Math.max(0, 1 - cdf(Math.floor(L))), under = Math.max(0, cdf(Math.ceil(L) - 1));
+  return { over, under, push: Math.max(0, 1 - over - under), q: over / Math.max(1e-9, over + under) };
+}
+function gridMu(sh, L, qNoVig) {
+  let lo = 0.05, hi = 200;
+  for (let i = 0; i < 50; i++) { const mid = (lo + hi) / 2; if (gridSides(sh, mid, L).q < qNoVig) lo = mid; else hi = mid; }
+  return (lo + hi) / 2;
+}
+/* a book's posted lines: its main pair plus any alternates kept at pull time */
+const bookRungs = q => [{ pt: q.over.pt, over: q.over.pr, under: q.under.pr }, ...(q.alts || [])];
+/* the fitted distribution for one prop, built on first use */
+function gridFor(E) {
+  if (E.grid !== undefined) return E.grid;
+  const sh = gridShape(E.market, E.model && E.model.games, E.line), mus = [];
+  for (const b in E.P.books) { const q = E.P.books[b]; if (!fin(q.over.pr) || !fin(q.under.pr)) continue; const po = amToProb(q.over.pr); mus.push(gridMu(sh, q.over.pt, po / (po + amToProb(q.under.pr)))); }
+  const mu = median(mus);
+  return (E.grid = fin(mu) ? { sh, mu, n: mus.length, at: L => gridSides(sh, mu, L) } : null);
+}
+/* every rung: fair odds from the grid, best price on either side from your books, EV */
+function gridLadder(E) {
+  const G = gridFor(E); if (!G || !fin(E.line)) return null;
+  const st = S.settings, books = Object.keys(E.P.books), mine = books.filter(k => st.myBooks.includes(k)), pool = mine.length ? mine : books;
+  const step = MARKETS[E.market].col === 'pts' || MARKETS[E.market].col === 'pra' ? 2 : 1, rungs = new Map();
+  const rung = L => { if (!rungs.has(L)) rungs.set(L, { line: L, main: L === E.line, best: null }); return rungs.get(L); };
+  for (let i = -3; i <= 3; i++) if (E.line + i * step > 0.4) rung(E.line + i * step);
+  rung(E.line);
+  for (const k of books) for (const r of bookRungs(E.P.books[k])) rung(r.pt);
+  for (const k of pool) for (const r of bookRungs(E.P.books[k])) {
+    const R = rung(r.pt), f = G.at(r.pt);
+    for (const side of ['over', 'under']) { if (!fin(r[side])) continue; const ev = evSide(f, side, r[side]); if (!R.best || ev > R.best.ev) R.best = { side, price: r[side], book: k, title: E.P.books[k].title, ev }; }
+  }
+  const rows = [...rungs.values()].sort((a, b) => a.line - b.line).map(R => { const f = G.at(R.line); return { ...R, q: f.q, push: f.push }; })
+    .filter(R => R.main || R.best || (R.q > 0.03 && R.q < 0.97));
+  return { G, rows, flagged: rows.filter(R => R.best && !E.started && R.best.ev >= st.minEv).length };
+}
+const GRID_FAM = { poisson: 'Poisson', nb: 'negative binomial', normal: 'normal', lognormal: 'log-normal' };
+function gridHtml(E) {
+  const gl = gridLadder(E); if (!gl) return '';
+  const { G, rows, flagged } = gl, st = S.settings, am = p => amStr(probToAm(clamp(p, 0.001, 0.999)));
+  const body = rows.map(R => { const b = R.best, hot = b && !E.started && b.ev >= st.minEv;
+    return `<tr${R.main ? ' class="main-rung"' : ''}><td>${totStr(R.line)}${R.main ? '<span class="muted" style="display:block;font-size:11px">main</span>' : ''}</td><td>${am(R.q)} <span class="muted">/ ${am(1 - R.q)}</span></td>`
+      + (b ? `<td>${b.side === 'over' ? 'O' : 'U'} ${amStr(b.price)} <span class="muted">${esc(bookShort(b.book, b.title))}</span></td><td class="${hot ? 'pos' : b.ev < 0 ? 'neg' : ''}">${sgnPct(b.ev)}${hot ? ' <span class="badge hot">Bet</span>' : ''}</td>` : '<td class="muted">no price</td><td class="muted">--</td>') + '</tr>'; }).join('');
+  const spread = G.sh.cv ? `, spread ${(G.sh.cv * 100).toFixed(0)}% of the mean` : G.sh.r ? `, dispersion ${G.sh.r.toFixed(1)}` : '';
+  return `<div class="section panel"><div class="row"><h3>Alt line grid</h3><span class="spacer"></span><span class="muted">${flagged} at or above ${(st.minEv * 100).toFixed(1)}%</span></div>
+    <p class="sub" style="margin:6px 0 10px">One ${GRID_FAM[G.sh.fam]} fitted to the no vig main line (mean ${G.mu.toFixed(1)}${spread}, from ${esc(G.sh.src)}). Market fair odds use no model blend, so EV here can differ from the board EV.</p>
+    <div class="tbl-wrap"><table class="grid-tbl"><thead><tr><th>Line</th><th>Market fair<span class="muted" style="display:block;font-size:11px;font-weight:400">no model, O / U</span></th><th>Best</th><th>EV</th></tr></thead><tbody>${body}</tbody></table></div>
+    ${rows.some(R => R.best && bookRungs(E.P.books[R.best.book]).length > 1) ? '' : '<p class="sub" style="margin-top:6px">Only main lines were posted. To price alternate lines, turn on Alternate lines in Settings (costs more credits).</p>'}</div>`;
+}
 /* player name key: accents, punctuation and suffixes removed */
 function pkey(n) { return String(n || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[.'’-]/g, '').replace(/\b(jr|sr|ii|iii|iv)\b/g, '').replace(/\s+/g, ' ').trim(); }
 /* =====================================================================
@@ -517,8 +599,9 @@ async function fetchEvents(key) {
   const { json, headers } = await getJSON(`${ODDS_BASE}/events?apiKey=${encodeURIComponent(key)}&dateFormat=iso`);
   return { events: (json || []).map(e => ({ id: e.id, start: e.commence_time, home: (teamByName(e.home_team) || {}).id, away: (teamByName(e.away_team) || {}).id })), remaining: parseInt(headers.get('x-requests-remaining'), 10) };
 }
-async function fetchProps(key, eventId, markets, regions) {
-  const mk = markets.map(m => MARKETS[m].odds).join(',');
+const ALT_SUFFIX = '_alternate';
+async function fetchProps(key, eventId, markets, regions, altLines) {
+  const mk = markets.flatMap(m => altLines ? [MARKETS[m].odds, MARKETS[m].odds + ALT_SUFFIX] : [MARKETS[m].odds]).join(',');
   let res;
   try { res = await getJSON(`${ODDS_BASE}/events/${eventId}/odds?apiKey=${encodeURIComponent(key)}&regions=${encodeURIComponent(regions)}&markets=${mk}&oddsFormat=american&dateFormat=iso`, { timeout: 25000 }); }
   catch (e) {
@@ -527,15 +610,18 @@ async function fetchProps(key, eventId, markets, regions) {
     if (e.status === 429) throw new Error('The Odds API is rate limiting or out of credits.');
     throw new Error('Could not reach The Odds API (' + (e.message || 'network') + ').');
   }
-  const props = {}; // key `${playerKey}|${market}` -> {name, market, books:{book:{title, over:{pt,pr}, under:{pt,pr}}}}
+  const props = {}; // key `${playerKey}|${market}` -> {name, market, books:{book:{title, over:{pt,pr}, under:{pt,pr}, alts?:[{pt,over,under}]}}}
+  const altAcc = {}; // id -> book -> every posted line, one sided allowed; attached to the main entry afterwards
   for (const bk of res.json.bookmakers || []) {
     for (const m of bk.markets || []) {
-      const mkt = ODDS_TO_MKT[m.key]; if (!mkt) continue;
+      const isAlt = m.key.endsWith(ALT_SUFFIX), mkt = ODDS_TO_MKT[isAlt ? m.key.slice(0, -ALT_SUFFIX.length) : m.key]; if (!mkt) continue;
       const by = {};
       for (const o of m.outcomes || []) {
         const name = o.description || ''; if (!name || !fin(o.point)) continue;
         const k = pkey(name) + '|' + o.point; (by[k] = by[k] || { name, pt: o.point })[/over/i.test(o.name) ? 'over' : 'under'] = o.price;
       }
+      for (const k in by) { const x = by[k], id = pkey(x.name) + '|' + mkt, a = altAcc[id] || (altAcc[id] = {}); (a[bk.key] = a[bk.key] || []).push({ pt: x.pt, over: fin(x.over) ? x.over : null, under: fin(x.under) ? x.under : null }); }
+      if (isAlt) continue;
       // a book can list several lines for one player (alternates); keep its main line, the most balanced pair
       const best = {};
       for (const k in by) { const x = by[k]; if (!fin(x.over) || !fin(x.under)) continue; const pk = pkey(x.name); const bal = Math.abs(amToProb(x.over) - amToProb(x.under)); if (!best[pk] || bal < best[pk].bal) best[pk] = { ...x, bal }; }
@@ -546,6 +632,15 @@ async function fetchProps(key, eventId, markets, regions) {
       }
     }
   }
+  for (const id in altAcc) {
+    const P = props[id]; if (!P) continue;
+    for (const b in altAcc[id]) {
+      const B = P.books[b]; if (!B) continue;
+      const seen = new Set([B.over.pt]), list = [];
+      for (const r of altAcc[id][b].sort((x, y) => x.pt - y.pt)) { if (seen.has(r.pt) || (r.over == null && r.under == null)) continue; seen.add(r.pt); list.push(r); }
+      if (list.length) B.alts = list;
+    }
+  }
   const remaining = parseInt(res.headers.get('x-requests-remaining'), 10), last = parseInt(res.headers.get('x-requests-last'), 10);
   return { t: now(), props, remaining: fin(remaining) ? remaining : null, cost: fin(last) ? last : null };
 }
@@ -554,7 +649,7 @@ async function fetchProps(key, eventId, markets, regions) {
    ===================================================================== */
 const DEFAULTS = {
   oddsKey: '', regions: 'us', myBooks: ['draftkings','fanduel','betmgm','williamhill_us','fanatics'],
-  markets: ['points','rebounds','assists','threes','pra'], unit: 10, minEv: 0.03, staleHours: 3, wModel: 0.25, slateDays: 2,
+  markets: ['points','rebounds','assists','threes','pra'], unit: 10, minEv: 0.03, staleHours: 3, wModel: 0.25, slateDays: 2, altLines: false,
 };
 const S = {
   tab: 'board', day: null, days: [], settings: loadSettings(),
@@ -714,7 +809,7 @@ async function pullProps(gameIds) {
     const g = findGame(gid), ev = g && eventFor(g); if (!ev) { S.error = 'The Odds API has not listed one of these games yet.'; continue; }
     setBusy(`Pulling props ${ok + 1} of ${gameIds.length}`);
     try {
-      const r = await fetchProps(st.oddsKey, ev.id, st.markets, st.regions);
+      const r = await fetchProps(st.oddsKey, ev.id, st.markets, st.regions, st.altLines);
       S.props[gid] = { t: r.t, props: r.props }; await DB.set('props:' + gid, S.props[gid]);
       if (fin(r.remaining)) S.credits = r.remaining; if (fin(r.cost)) spent += r.cost;
       recordHistory(g, r); ok++;
@@ -903,12 +998,13 @@ function chartSvg(E, line) {
     <text x="${padL}" y="${H - 4}" class="tick">${n} games ago</text><text x="${W}" y="${H - 4}" text-anchor="end" class="tick">last game</text></svg>`;
 }
 function sliderReadout(E, L) {
-  const m = MARKETS[E.market], s = sidesAt(E, L); const hr = E.model ? hitRates(E.model.games, m.col, L) : null;
+  const m = MARKETS[E.market], s = sidesAt(E, L), G = gridFor(E), gr = G ? G.at(L) : null; const hr = E.model ? hitRates(E.model.games, m.col, L) : null;
   const hrc = h => h ? `${h.over} of ${h.n} (${pct(h.over / h.n)})` : '--';
   return `<div class="kv">
     <div><span>Fair over</span><b>${s ? pct(s.fair.q, 1) : '--'}</b><small class="muted">${s ? amStr(probToAm(s.fair.q)) + ' fair' : ''}</small></div>
     <div><span>Market over</span><b>${s && s.mkt ? pct(s.mkt.q, 1) : '--'}</b></div>
     <div><span>Model over</span><b>${s && s.mod ? pct(s.mod.q, 1) : '--'}</b></div>
+    <div><span>Grid over</span><b>${gr ? pct(gr.q, 1) : '--'}</b><small class="muted">${gr ? amStr(probToAm(clamp(gr.q, 0.001, 0.999))) + ' market fair' : ''}</small></div>
     <div><span>Last 10</span><b>${hr && hr.l10 ? pct(hr.l10.over / hr.l10.n) : '--'}</b><small class="muted">${hr ? hrc(hr.l10) : ''}</small></div>
     <div><span>Last 20</span><b>${hr && hr.l20 ? pct(hr.l20.over / hr.l20.n) : '--'}</b><small class="muted">${hr ? hrc(hr.l20) : ''}</small></div>
     <div><span>${hr ? hr.seasonLabel : 'Season'}</span><b>${hr && hr.season ? pct(hr.season.over / hr.season.n) : '--'}</b><small class="muted">${hr ? hrc(hr.season) : ''}</small></div>
@@ -939,6 +1035,7 @@ function openProp(key) {
   <div class="section panel"><div class="row"><h3>Try another line</h3><span class="spacer"></span><b class="cond" id="sliderVal" style="font-size:24px">${totStr(S.sliderLine)}</b></div>
     <input type="range" id="lineSlider" min="${lo}" max="${hi}" step="0.5" value="${S.sliderLine}" aria-label="Line" style="width:100%;margin:10px 0">
     <div id="sliderOut">${sliderReadout(E, S.sliderLine)}</div></div>
+  ${gridHtml(E)}
   <div class="section"><h3 style="margin-bottom:8px">Every book</h3><div class="tbl-wrap"><table><thead><tr><th>Book</th><th>Line</th><th>Over, EV</th><th>Under, EV</th></tr></thead><tbody>${bookRows}</tbody></table></div>
     <p class="sub" style="margin-top:6px">${E.ownBooks ? 'Best prices come from your books only; consensus uses every book.' : 'None of your books posted this prop, so the best price comes from any book.'} Fair prices use the market plus ${Math.round(S.settings.wModel * 100)}% of the model.</p></div>
   <div class="section row">${sideBtn('over')}${sideBtn('under')}</div>
@@ -982,6 +1079,7 @@ function viewSettings() {
     <div class="grid2"><div class="field"><label for="regions">Regions</label><select id="regions"><option value="us" ${st.regions === 'us' ? 'selected' : ''}>US</option><option value="us,us2" ${st.regions === 'us,us2' ? 'selected' : ''}>US and US2 (doubles the cost)</option></select></div>
     <div class="field"><label for="slateDays">Days shown</label><input id="slateDays" type="number" min="1" max="4" value="${st.slateDays}"></div></div>
     <div class="field"><label>Markets to pull</label><div class="books-grid">${mks}</div><span class="hint">Each market costs one credit per game per region.</span></div>
+    <div class="field"><label class="check"><input type="checkbox" id="altLines" ${st.altLines ? 'checked' : ''}>Alternate lines</label><span class="hint">Prices every rung in the alt line grid. Off by default: it doubles the credits per game (${st.markets.length * st.regions.split(',').length} now, ${st.markets.length * st.regions.split(',').length * 2} with this on). The free Odds API plan has 500 credits a month.</span></div>
     <div class="field"><label>Your books</label><div class="books-grid">${books}</div><span class="hint">Best price and EV use only these. Consensus uses every book.</span></div>
   </div>
   <div class="panel section"><h3 style="margin-bottom:10px">Decisions</h3>
@@ -1108,6 +1206,7 @@ async function refreshAll({ force = false } = {}) {
 function readSettings() {
   const st = { ...S.settings };
   st.oddsKey = $('#oddsKey').value.trim(); st.regions = $('#regions').value; st.slateDays = clamp(parseInt($('#slateDays').value, 10) || 2, 1, 4);
+  st.altLines = $('#altLines').checked;
   st.myBooks = $$('[data-book]').filter(x => x.checked).map(x => x.dataset.book);
   const mk = $$('[data-mkt]').filter(x => x.checked).map(x => x.dataset.mkt); st.markets = mk.length ? mk : DEFAULTS.markets;
   st.wModel = clamp((parseFloat($('#wModel').value) || 0) / 100, 0, 1); st.minEv = clamp((parseFloat($('#minEv').value) || 0) / 100, 0, 0.5);
