@@ -223,9 +223,9 @@ test('Import still accepts a 1.0.0 backup and leaves saved props (and their alts
   assert.deepEqual(JSON.parse(a.run('JSON.stringify(S.props)')), { g1: withAlts() });
 });
 
-/* ------------------------------------------------------------------ 3c. War Room / outbound data */
-test('Hoops sends nothing to War Room: the only outbound hosts are ESPN and The Odds API', () => {
-  assert.equal(/war[\s_-]?room/i.test(HTML), false, 'no War Room code in index.html');
+/* ------------------------------------------------------------------ 3c. the app's export and outbound hosts */
+test('the app sends data nowhere else: the only outbound hosts are ESPN and The Odds API', () => {
+  assert.equal(/sendBeacon|postMessage|navigator\.share|XMLHttpRequest|WebSocket/.test(SCRIPT), false, 'no other outbound channel in index.html');
   const hosts = new Set((SCRIPT.match(/https?:\/\/[^/'"`\s$]+/g) || []).map(u => u.replace(/^https?:\/\//, '')));
   assert.deepEqual([...hosts].sort(), ['api.the-odds-api.com', 'site.api.espn.com']);
 });
